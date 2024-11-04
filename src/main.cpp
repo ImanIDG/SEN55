@@ -196,6 +196,11 @@ void loop() {
         indexSerial++; // Increment the index for Serial buffer
         // When buffer is full (9 bytes)
         if (indexSerial >= BUFFER_SIZE) {
+            Serial.println("SEND");
+            for (int i = 0 ; i < indexSerial; i++) {
+                Serial.printf("0x%02X ", buffer[i]);
+            }
+            Serial.println();
             Serial2.write(buffer, BUFFER_SIZE); // Send buffer to Serial2
             indexSerial = 0; // Reset the index
         }
@@ -207,8 +212,14 @@ void loop() {
         indexSerial2++; // Increment the index for Serial2 buffer
         // When buffer is full (9 bytes)
         if (indexSerial2 >= BUFFER_SIZE) {
+            Serial.println("REC");
+            for (int i = 0 ; i < indexSerial; i++) {
+                Serial.printf("0x%02X ", buffer[i]);
+            }
+            Serial.println();
             Serial.write(buffer, BUFFER_SIZE); // Send buffer to Serial
             indexSerial2 = 0; // Reset the index
+            Serial.println();
         }
     }
     /*
