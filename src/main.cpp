@@ -118,7 +118,6 @@ void printSerialNumber() {
 }
 
 #define BUFFER_SIZE 9
-uint8_t buffer[BUFFER_SIZE];
 uint8_t indexSerial = 0;
 uint8_t indexSerial2 = 0;
 
@@ -190,23 +189,11 @@ void setup() {
 }
 
 void loop() {
-    // Check if there is any data available on the Serial port
-    while (Serial.available()) {
-        buffer[indexSerial] = Serial.read(); // Read one byte from Serial
-        indexSerial++; // Increment the index for Serial buffer
-        // When buffer is full (9 bytes)
-        if (indexSerial >= BUFFER_SIZE) {
-            Serial.println("SEND");
-            for (int i = 0 ; i < indexSerial; i++) {
-                Serial.printf("0x%02X ", buffer[i]);
-            }
-            Serial.println();
-            Serial2.write(buffer, BUFFER_SIZE); // Send buffer to Serial2
-            indexSerial = 0; // Reset the index
-        }
-    }
-    // Check if there is any data available on the Serial2 port
-    while (Serial2.available()) {
+    delay(5000);
+    uint8_t buffer[BUFFER_SIZE] = {0xff, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
+    Serial.println("SEND");
+    Serial2.write(buffer, BUFFER_SIZE);
+    do {
         buffer[indexSerial2] = Serial2.read();
         // Read one byte from Serial2
         indexSerial2++; // Increment the index for Serial2 buffer
@@ -222,6 +209,8 @@ void loop() {
             Serial.println();
         }
     }
+    while (Serial2.available());
+    Serial.println("DONE");
     /*
     uint16_t error;
     char errorMessage[256];
