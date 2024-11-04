@@ -38,6 +38,7 @@
 #include <Arduino.h>
 #include <SensirionI2CSen5x.h>
 #include <Wire.h>
+#include <MH411D.h>
 
 // The used commands use up to 48 bytes. On some Arduino's the default buffer
 // space is not large enough
@@ -50,6 +51,7 @@
 #endif
 
 SensirionI2CSen5x sen5x;
+WinsenSensors myMH411D;
 
 void printModuleVersions() {
     uint16_t error;
@@ -117,7 +119,7 @@ void printSerialNumber() {
 
 void setup() {
 
-    Serial.begin(115200);
+    Serial.begin(9600);
     while (!Serial) {
         delay(100);
     }
@@ -125,7 +127,7 @@ void setup() {
     Wire.begin();
 
     sen5x.begin(Wire);
-
+    myMH411D.begin(&Serial1);
     uint16_t error;
     char errorMessage[256];
     error = sen5x.deviceReset();
@@ -185,7 +187,14 @@ void loop() {
     char errorMessage[256];
 
     delay(1000);
-
+    
+    if( myMH411D.startMeasure() != 0) {
+        Serial.print("CO2 concentration: ");
+        Serial.println(myMH411D.getGasConcentration(), DEC);
+    }
+    else {
+        Serial.print("Measure failed !!");
+    }
     // Read Measurement
     float massConcentrationPm1p0;
     float massConcentrationPm2p5;
