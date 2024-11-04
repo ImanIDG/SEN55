@@ -1,44 +1,200 @@
-#include <Arduino.h>
-/*
- * I2C-Generator: 0.3.0
- * Yaml Version: 2.1.3
- * Template Version: 0.7.0-112-g190ecaa
- */
-/*
- * Copyright (c) 2021, Sensirion AG
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * * Redistributions of source code must retain the above copyright notice, this
- *   list of conditions and the following disclaimer.
- *
- * * Redistributions in binary form must reproduce the above copyright notice,
- *   this list of conditions and the following disclaimer in the documentation
- *   and/or other materials provided with the distribution.
- *
- * * Neither the name of Sensirion AG nor the names of its
- *   contributors may be used to endorse or promote products derived from
- *   this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
+#define SENSENET_DEBUG // enable debug on SerialMon
+#define SerialMon Serial // if you need DEBUG SerialMon should be defined
+
+#define FIRMWARE_TITLE "Arduino_Data_Collector"
+#define FIRMWARE_VERSION "0.3.14"
 
 #include <Arduino.h>
+#include "sensenet.h"
+#include "WiFi.h"
+#include "Wire.h"
+#include "SPI.h"
+//#include "Preferences.h"
+#include "Ticker.h"
+#include <esp_task_wdt.h>
+#include <ESP32Time.h>
+
+#include "DEV_Config.h"
+#include "L76X.h"
+
 #include <SensirionI2CSen5x.h>
-#include <Wire.h>
 #include <MH411D.h>
+
+#define WIFI_SSID "Sensenet_2.4G"
+#define WIFI_PASS "Sensenet123"
+#define TB_URL "tb.sensenet.ca"
+
+// for COM7
+//#define TOKEN "SGP4xESP32_3"
+
+// for COM8
+//#define TOKEN "SGP4xESP32_2"
+
+// for COM10
+#define TOKEN "GPSESP32"
+
+ESP32Time internalRtc(0);  // offset in seconds GMT
+Ticker restartTicker;
+//Preferences preferences;
+NetworkInterface wifiInterface("wifi", 2, 2);
+NetworkInterfacesController networkController;
+MQTTController mqttController;
+MQTTOTA ota(&mqttController, 5120);
+
+WiFiClient wiFiClient;
+
+GNRMC GPS1;
+Coordinates B_GPS;
+int i = 0;
+char buff_G[800] = {0};
+
+void resetESP() {
+    ESP.restart();
+}
+
+uint64_t getTimestamp() {
+    if (internalRtc.getEpoch() < 946713600)
+        return 0;
+    uint64_t ts = internalRtc.getEpoch();
+    ts = ts * 1000L;
+    ts = ts + internalRtc.getMillis();
+    return ts;
+}
+
+// Sampling interval in seconds
+char errorMessage[32];
+
+bool on_message(const String &topic, DynamicJsonDocument json) {
+    Serial.print("Topic1: ");
+    Serial.println(topic);
+    Serial.print("Message1: ");
+    Serial.println(json.as<String>());
+
+    if (json.containsKey("shared")) {
+        JsonObject sharedKeys = json["shared"].as<JsonObject>();
+        for (JsonPair kv: sharedKeys)
+            json[kv.key()] = sharedKeys[kv.key()];
+
+    }
+
+    if (json.containsKey("method")) {
+        String method = json["method"].as<String>();
+
+        bool handled = false;
+        if (method.equalsIgnoreCase("restart_device")) {
+            float seconds = 0;
+            if (json["params"].containsKey("seconds"))
+                seconds = json["params"]["seconds"];
+            if (seconds == 0) seconds = 1;
+            printDBGln("Device Will Restart in " + String(seconds) + " Seconds");
+            restartTicker.once(seconds, resetESP);
+            handled = true;
+        }
+
+        if (handled) {
+            String responseTopic = String(topic);
+            responseTopic.replace("request", "response");
+            DynamicJsonDocument responsePayload(300);
+            responsePayload["result"] = "true";
+            mqttController.addToPublishQueue(responseTopic, responsePayload.as<String>(), true);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void connectToNetwork() {
+    Serial.println("Added WiFi Interface");
+    networkController.addNetworkInterface(&wifiInterface);
+
+    networkController.setAutoReconnect(true, 10000);
+    networkController.autoConnectToNetwork();
+}
+
+void connectToPlatform(Client &client, const bool enableOTA) {
+
+    Serial.println("Trying to Connect Platform");
+    mqttController.connect(client, "esp", TOKEN, "", TB_URL,
+                           1883, on_message,
+                           nullptr, [&]() {
+                Serial.println("Connected To Platform");
+                DynamicJsonDocument info(512);
+                info["Token"] = TOKEN;
+                info.shrinkToFit();
+                mqttController.sendAttributes(info, true);
+                if (enableOTA)
+                    ota.begin(FIRMWARE_TITLE, FIRMWARE_VERSION);
+                else
+                    ota.stopHandleOTAMessages();
+
+                DynamicJsonDocument requestKeys(512);
+                requestKeys["sharedKeys"] = "desiredAllowSleep,desiredDisableIR,desiredSEN55TempOffset";
+                requestKeys.shrinkToFit();
+                mqttController.requestAttributesJson(requestKeys.as<String>());
+
+                if (getTimestamp() == 0) {
+                    DynamicJsonDocument requestTime(512);
+                    requestTime["method"] = "requestTimestamp";
+                    requestTime.shrinkToFit();
+                    mqttController.requestRPC(requestTime.as<String>(),
+                                              [](const String &rpcTopic, const DynamicJsonDocument &rpcJson) -> bool {
+                                                  Serial.print("Updating Internal RTC to: ");
+                                                  Serial.println(rpcJson.as<String>());
+                                                  uint64_t tsFromCloud = rpcJson["timestamp"].as<uint64_t>();
+                                                  tsFromCloud = tsFromCloud / 1000;
+                                                  internalRtc.setTime(tsFromCloud);
+                                                  Serial.print("Internal RTC updated to: ");
+                                                  Serial.println(internalRtc.getDateTime(true));
+                                                  getTimestamp();
+                                                  return true;
+                                              });
+                } else {
+                    Serial.print("Internal RTC updated to: ");
+                    Serial.println(internalRtc.getDateTime(true));
+                }
+            });
+}
+
+int retry = 0;
+
+void initInterfaces() {
+    retry = 0;
+    wifiInterface.setTimeoutMs(30000);
+    wifiInterface.setConnectInterface([]() -> bool {
+        Serial.println(String("Connecting To WiFi ") + WIFI_SSID);
+        WiFi.mode(WIFI_MODE_NULL);
+        delay(2000);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        return true;
+    });
+    wifiInterface.setConnectionCheckInterfaceInterface([]() -> bool {
+        return WiFi.status() == WL_CONNECTED;
+    });
+    wifiInterface.OnConnectingEvent([]() {
+        Serial.print(".");
+    }, 500);
+    wifiInterface.OnConnectedEvent([]() {
+        retry = 0;
+        Serial.println(String("Connected to WIFI with IP: ") + WiFi.localIP().toString());
+        connectToPlatform(wiFiClient, true);
+        DynamicJsonDocument data(200);
+        data["Connection Type"] = "WIFI";
+        data["IP"] = WiFi.localIP().toString();
+        data.shrinkToFit();
+    });
+    wifiInterface.OnTimeoutEvent([]() {
+        retry++;
+        Serial.println("WiFi Connecting Timeout! retrying for " + String(retry) + " Times");
+        WiFi.mode(WIFI_MODE_NULL);
+
+//        if (retry >= 20)
+//            ESP.restart();
+    });
+}
+
+uint64_t lastSEN55_MH_411D = 0;
 
 // The used commands use up to 48 bytes. On some Arduino's the default buffer
 // space is not large enough
@@ -117,19 +273,138 @@ void printSerialNumber() {
     }
 }
 
-void setup() {
+void loopSEN55_MH_411D(DynamicJsonDocument &data) {
+    uint16_t error;
+    char errorMessage[256];
 
-    Serial.begin(9600);
-    while (!Serial) {
-        delay(100);
+    if( myMH411D.startMeasure() != 0) {
+        Serial.print("CO2 concentration: ");
+        int foodata = myMH411D.getGasConcentration();
+        Serial.println(foodata, DEC);
+        data["MH411D"] = String(foodata);
+    }
+    else {
+        Serial.print("Measure failed !!");
+        Serial.print("myMH411D.getGasConcentration()");
+        error = 0;
+        errorToString(error, errorMessage, 256);
+    }
+    // Read Measurement
+    float massConcentrationPm1p0;
+    float massConcentrationPm2p5;
+    float massConcentrationPm4p0;
+    float massConcentrationPm10p0;
+    float ambientHumidity;
+    float ambientTemperature;
+    float vocIndex;
+    float noxIndex;
+
+    error = sen5x.readMeasuredValues(
+        massConcentrationPm1p0, massConcentrationPm2p5, massConcentrationPm4p0,
+        massConcentrationPm10p0, ambientHumidity, ambientTemperature, vocIndex,
+        noxIndex);
+
+    if (error) {
+        Serial.print("Error trying to execute readMeasuredValues(): ");
+        errorToString(error, errorMessage, 256);
+        Serial.println(errorMessage);
+    } else {
+        Serial.print("MassConcentrationPm1p0:");
+        Serial.print(massConcentrationPm1p0);
+        data["massConcentrationPm1p0"] = String(massConcentrationPm1p0);
+        Serial.print("\t");
+        Serial.print("MassConcentrationPm2p5:");
+        Serial.print(massConcentrationPm2p5);
+        data["massConcentrationPm2p5"] = String(massConcentrationPm2p5);
+        Serial.print("\t");
+        Serial.print("MassConcentrationPm4p0:");
+        Serial.print(massConcentrationPm4p0);
+        data["massConcentrationPm4p0"] = String(massConcentrationPm4p0);
+        Serial.print("\t");
+        Serial.print("MassConcentrationPm10p0:");
+        Serial.print(massConcentrationPm10p0);
+        data["massConcentrationPm10p0"] = String(massConcentrationPm10p0);
+        Serial.print("\t");
+        Serial.print("AmbientHumidity:");
+        if (isnan(ambientHumidity)) {
+            Serial.print("n/a");
+        } else {
+            Serial.print(ambientHumidity);
+            data["ambientHumidity"] = String(ambientHumidity);
+        }
+        Serial.print("\t");
+        Serial.print("AmbientTemperature:");
+        if (isnan(ambientTemperature)) {
+            Serial.print("n/a");
+        } else {
+            Serial.print(ambientTemperature);
+            data["ambientTemperature"] = String(ambientTemperature);
+        }
+        Serial.print("\t");
+        Serial.print("VocIndex:");
+        if (isnan(vocIndex)) {
+            Serial.print("n/a");
+        } else {
+            Serial.print(vocIndex);
+            data["vocIndex"] = String(vocIndex);
+        }
+        Serial.print("\t");
+        Serial.print("NoxIndex:");
+        if (isnan(noxIndex)) {
+            Serial.println("n/a");
+        } else {
+            Serial.println(noxIndex);
+            data["noxIndex"] = String(noxIndex);
+        }
+    }
+}
+
+void core0Loop(void *parameter) {
+    //Dont do anything 1
+    esp_task_wdt_init(600, true); //enable panic so ESP32 restarts
+    esp_task_wdt_add(NULL); //add current thread to WDT watch
+    //Dont do anything1
+
+    lastSEN55_MH_411D = Uptime.getMilliseconds();
+    uint64_t now = Uptime.getMilliseconds();
+    DynamicJsonDocument data(5120);
+    if (now - lastSEN55_MH_411D > 60000) {
+        lastSEN55_MH_411D = now;
+        loopSEN55_MH_411D(data);
     }
 
+    if (data.size() > 0 && getTimestamp() > 0) {
+        data.shrinkToFit();
+        Serial.println("Data: " + data.as<String>());
+        mqttController.sendTelemetry(data, true, getTimestamp());
+    }
+    delayMicroseconds(1);
+    esp_task_wdt_reset();
+}
+
+void setup() {
+    //Dont do anything in setup
+    //Add setup SEN55
+    internalRtc.setTime(1000);
+    btStop();
+    esp_task_wdt_init(60, true); //enable panic so ESP32 restarts
+    esp_task_wdt_add(NULL); //add current thread to WDT watch
+    esp_task_wdt_reset();
+
+    Serial.begin(9600);
+//    preferences.begin("Configs", false);
+//    Serial.println("Hello from: " + preferences.getString("token", "not-set"));
+    mqttController.init();
+    mqttController.sendSystemAttributes(true);
+    initInterfaces();
     Wire.begin();
+    esp_task_wdt_reset();
+
+    uint16_t error;
+    char errorMessage[256];
 
     sen5x.begin(Wire);
     myMH411D.begin(&Serial1);
-    uint16_t error;
-    char errorMessage[256];
     error = sen5x.deviceReset();
     if (error) {
         Serial.print("Error trying to execute deviceReset(): ");
@@ -180,79 +455,44 @@ void setup() {
         errorToString(error, errorMessage, 256);
         Serial.println(errorMessage);
     }
-}
+    delay(1000);  // needed on some Arduino boards in order to have Serial ready
 
-void loop() {
-    uint16_t error;
-    char errorMessage[256];
+    esp_task_wdt_reset();
+    connectToNetwork();
+    esp_task_wdt_reset();
 
     delay(1000);
-    
-    if( myMH411D.startMeasure() != 0) {
-        Serial.print("CO2 concentration: ");
-        Serial.println(myMH411D.getGasConcentration(), DEC);
-    }
-    else {
-        Serial.print("Measure failed !!");
-    }
-    // Read Measurement
-    float massConcentrationPm1p0;
-    float massConcentrationPm2p5;
-    float massConcentrationPm4p0;
-    float massConcentrationPm10p0;
-    float ambientHumidity;
-    float ambientTemperature;
-    float vocIndex;
-    float noxIndex;
+    xTaskCreatePinnedToCore(
+            core0Loop, // Function to implement the task
+            "Core0Loop", // Name of the task
+            10000, // Stack size in words
+            NULL,  // Task input parameter
+            0, // Priority of the task
+            NULL,  // Task handle.
+            0); // Core where the task should run
+    esp_task_wdt_reset();
+}
 
-    error = sen5x.readMeasuredValues(
-        massConcentrationPm1p0, massConcentrationPm2p5, massConcentrationPm4p0,
-        massConcentrationPm10p0, ambientHumidity, ambientTemperature, vocIndex,
-        noxIndex);
+uint64_t core1Heartbeat;
 
-    if (error) {
-        Serial.print("Error trying to execute readMeasuredValues(): ");
-        errorToString(error, errorMessage, 256);
-        Serial.println(errorMessage);
-    } else {
-        Serial.print("MassConcentrationPm1p0:");
-        Serial.print(massConcentrationPm1p0);
-        Serial.print("\t");
-        Serial.print("MassConcentrationPm2p5:");
-        Serial.print(massConcentrationPm2p5);
-        Serial.print("\t");
-        Serial.print("MassConcentrationPm4p0:");
-        Serial.print(massConcentrationPm4p0);
-        Serial.print("\t");
-        Serial.print("MassConcentrationPm10p0:");
-        Serial.print(massConcentrationPm10p0);
-        Serial.print("\t");
-        Serial.print("AmbientHumidity:");
-        if (isnan(ambientHumidity)) {
-            Serial.print("n/a");
-        } else {
-            Serial.print(ambientHumidity);
-        }
-        Serial.print("\t");
-        Serial.print("AmbientTemperature:");
-        if (isnan(ambientTemperature)) {
-            Serial.print("n/a");
-        } else {
-            Serial.print(ambientTemperature);
-        }
-        Serial.print("\t");
-        Serial.print("VocIndex:");
-        if (isnan(vocIndex)) {
-            Serial.print("n/a");
-        } else {
-            Serial.print(vocIndex);
-        }
-        Serial.print("\t");
-        Serial.print("NoxIndex:");
-        if (isnan(noxIndex)) {
-            Serial.println("n/a");
-        } else {
-            Serial.println(noxIndex);
-        }
+void loop() {
+    //Dont do anything
+    esp_task_wdt_reset();
+
+    if (Serial.available()) {
+        if (Serial.readString().indexOf("reboot") >= 0)
+            resetESP();
+    }
+
+    if (networkController.getCurrentNetworkInterface() != nullptr &&
+        networkController.getCurrentNetworkInterface()->lastConnectionStatus()) {
+        mqttController.loop();
+    }
+
+    networkController.loop();
+
+    if ((Uptime.getSeconds() - core1Heartbeat) > 10) {
+        core1Heartbeat = Uptime.getSeconds();
+        printDBGln("Core 1 Heartbeat");
     }
 }
