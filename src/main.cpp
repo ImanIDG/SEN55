@@ -404,7 +404,7 @@ void setup() {
     char errorMessage[256];
 
     sen5x.begin(Wire);
-    myMH411D.begin(&Serial1);
+    myMH411D.begin(&Serial2);
     error = sen5x.deviceReset();
     if (error) {
         Serial.print("Error trying to execute deviceReset(): ");
