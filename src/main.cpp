@@ -120,10 +120,11 @@ void printSerialNumber() {
 void setup() {
 
     Serial.begin(9600);
+    Serial2.begin(9600);
     while (!Serial) {
         delay(100);
     }
-
+    /*
     Wire.begin();
 
     sen5x.begin(Wire);
@@ -180,9 +181,25 @@ void setup() {
         errorToString(error, errorMessage, 256);
         Serial.println(errorMessage);
     }
+    */
 }
 
 void loop() {
+    // Check if there is any data available on the Serial port
+    if (Serial.available()) {
+        // Read the data from Serial
+        int data = Serial.read();
+        // Send the data to Serial2
+        Serial2.write(data);
+    }
+    // Check if there is any data available on the Serial2 port
+    if (Serial2.available()) {
+        // Read the data from Serial2
+        int data = Serial2.read();
+        // Send the data to Serial
+        Serial.write(data);
+    }
+    /*
     uint16_t error;
     char errorMessage[256];
 
@@ -255,4 +272,5 @@ void loop() {
             Serial.println(noxIndex);
         }
     }
+    */
 }
